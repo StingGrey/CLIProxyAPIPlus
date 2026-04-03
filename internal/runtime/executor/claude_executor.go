@@ -17,7 +17,6 @@ import (
 	"time"
 
 	"github.com/andybalholm/brotli"
-	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
 	claudeauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -92,7 +91,7 @@ func (e *ClaudeExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Aut
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
-	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
 
@@ -133,7 +132,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body = ensureModelMaxTokens(body, baseModel)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
@@ -160,9 +158,6 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
 	}
-	if experimentalCCHSigningEnabled(e.cfg, auth) {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
-	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(bodyForUpstream))
@@ -188,7 +183,7 @@ func (e *ClaudeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, r
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -303,7 +298,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	body = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", body, originalTranslated, requestedModel)
-	body = ensureModelMaxTokens(body, baseModel)
 
 	// Disable thinking if tool_choice forces tool use (Anthropic API constraint)
 	body = disableThinkingIfToolChoiceForced(body)
@@ -326,9 +320,6 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 	bodyForUpstream := body
 	if isClaudeOAuthToken(apiKey) && !auth.ToolPrefixDisabled() {
 		bodyForUpstream = applyClaudeToolPrefix(body, claudeToolPrefix)
-	}
-	if experimentalCCHSigningEnabled(e.cfg, auth) {
-		bodyForUpstream = signAnthropicMessagesBody(bodyForUpstream)
 	}
 
 	url := fmt.Sprintf("%s/v1/messages?beta=true", baseURL)
@@ -355,7 +346,7 @@ func (e *ClaudeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.A
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -522,7 +513,7 @@ func (e *ClaudeExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Aut
 		AuthValue: authValue,
 	})
 
-	httpClient := helps.NewUtlsHTTPClient(e.cfg, auth, 0)
+	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
 		helps.RecordAPIResponseError(ctx, e.cfg, err)
@@ -807,11 +798,6 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	if ginCtx, ok := r.Context().Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
 		ginHeaders = ginCtx.Request.Header
 	}
-	stabilizeDeviceProfile := helps.ClaudeDeviceProfileStabilizationEnabled(cfg)
-	var deviceProfile helps.ClaudeDeviceProfile
-	if stabilizeDeviceProfile {
-		deviceProfile = helps.ResolveClaudeDeviceProfile(auth, apiKey, ginHeaders, cfg)
-	}
 
 	baseBetas := "claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14,context-management-2025-06-27,prompt-caching-scope-2026-01-05"
 	if val := strings.TrimSpace(ginHeaders.Get("Anthropic-Beta")); val != "" {
@@ -851,22 +837,13 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 	r.Header.Set("Anthropic-Beta", baseBetas)
 
 	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Version", "2023-06-01")
-	// Only set browser access header for API key mode; real Claude Code CLI does not send it.
-	if useAPIKey {
-		misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
-	}
+	misc.EnsureHeader(r.Header, ginHeaders, "Anthropic-Dangerous-Direct-Browser-Access", "true")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-App", "cli")
 	// Values below match Claude Code 2.1.63 / @anthropic-ai/sdk 0.74.0 (updated 2026-02-28).
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Retry-Count", "0")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime", "node")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Lang", "js")
 	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Timeout", hdrDefault(hd.Timeout, "600"))
-	// Session ID: stable per auth/apiKey, matches Claude Code's X-Claude-Code-Session-Id header.
-	misc.EnsureHeader(r.Header, ginHeaders, "X-Claude-Code-Session-Id", helps.CachedSessionID(apiKey))
-	// Per-request UUID, matches Claude Code's x-client-request-id for first-party API.
-	if isAnthropicBase {
-		misc.EnsureHeader(r.Header, ginHeaders, "x-client-request-id", uuid.New().String())
-	}
 	r.Header.Set("Connection", "keep-alive")
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
@@ -878,13 +855,20 @@ func applyClaudeHeaders(r *http.Request, auth *cliproxyauth.Auth, apiKey string,
 		r.Header.Set("Accept", "application/json")
 		r.Header.Set("Accept-Encoding", "gzip, deflate, br, zstd")
 	}
-	// Legacy mode keeps OS/Arch runtime-derived; stabilized mode pins OS/Arch
-	// to the configured baseline while still allowing newer official
-	// User-Agent/package/runtime tuples to upgrade the software fingerprint.
-	if stabilizeDeviceProfile {
-		helps.ApplyClaudeDeviceProfileHeaders(r, deviceProfile)
+	// Restore v6.8.54 device header behavior: use runtime-derived OS/Arch directly
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Runtime-Version", hdrDefault(hd.RuntimeVersion, "v24.3.0"))
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Package-Version", hdrDefault(hd.PackageVersion, "0.74.0"))
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Arch", helps.MapStainlessArch())
+	misc.EnsureHeader(r.Header, ginHeaders, "X-Stainless-Os", helps.MapStainlessOS())
+	// For User-Agent, only forward the client's header if it's already a Claude Code client.
+	clientUA := ""
+	if ginHeaders != nil {
+		clientUA = ginHeaders.Get("User-Agent")
+	}
+	if strings.HasPrefix(clientUA, "claude-cli") {
+		r.Header.Set("User-Agent", clientUA)
 	} else {
-		helps.ApplyClaudeLegacyDeviceHeaders(r, ginHeaders, cfg)
+		r.Header.Set("User-Agent", hdrDefault(hd.UserAgent, "claude-cli/2.1.63 (external, cli)"))
 	}
 	var attrs map[string]string
 	if auth != nil {
